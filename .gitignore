@@ -1,0 +1,19 @@
+﻿.env
+venv/
+.venv/
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+Kurukshetra/
+# Node / Frontend (if applicable)
+node_modules/
+dist/
+build/
+
+# Logs, DBs & IDE files
+*.log
+*.db
+.vscode/
+.idea/
+.DS_Store

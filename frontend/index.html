@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kurukshetra — Multi-Agent Arena</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <!-- Top Header Bar -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-icon">⚔️</span>
+      <div>
+        <h1>KURUKSHETRA</h1>
+        <p class="subtitle">Live Autonomous Multi-Agent Arena</p>
+      </div>
+    </div>
+
+    <div class="topbar-stats">
+      <span id="conn-badge" class="pill pill-offline">Connecting...</span>
+      <span id="turn-counter" class="pill">Turn: 0 / 0</span>
+      <span id="token-counter" class="pill">Tokens: 0</span>
+      <button id="btn-rewake" class="btn btn-ghost" title="Ask all 4 agents to greet again">
+        Re-Wake Agents
+      </button>
+    </div>
+  </header>
+
+  <!-- Main Two-Column Arena -->
+  <main class="layout">
+    <!-- Left Sidebar: Roster + Controls -->
+    <aside class="sidebar">
+      <section class="panel">
+        <div class="panel-header">
+          <h2>Arena Warriors</h2>
+          <span class="hint">Check 2–4 to debate</span>
+        </div>
+        <div id="roster-list" class="roster-list">
+          <!-- Dynamically populated via WebSocket roster_update -->
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Launch Debate</h2>
+        <label class="field-label" for="topic-input">Topic / Challenge</label>
+        <textarea
+          id="topic-input"
+          rows="3"
+          placeholder="e.g., Should startups build a custom agent runtime or adopt LangGraph?"
+        ></textarea>
+
+        <div class="row-inline">
+          <label class="field-label" for="max-turns-input">Max Turns</label>
+          <input id="max-turns-input" type="number" min="2" max="30" value="12" />
+        </div>
+
+        <button id="btn-start" class="btn btn-primary full-width">
+          Start Autonomous Debate
+        </button>
+
+        <div class="control-grid">
+          <button id="btn-pause" class="btn btn-warn" disabled>Pause</button>
+          <button id="btn-resume" class="btn btn-success" disabled>Resume</button>
+          <button id="btn-stop" class="btn btn-danger" disabled>Stop</button>
+        </div>
+      </section>
+    </aside>
+
+    <!-- Right Stage: Live Debate Feed + Interject Bar -->
+    <section class="stage">
+      <div id="topic-banner" class="topic-banner hidden">
+        <span id="stage-status" class="status-tag">LIVE</span>
+        <span id="active-topic-text"></span>
+      </div>
+
+      <div id="feed" class="feed">
+        <!-- Live agent cards, reasoning boxes, and system notices appear here -->
+      </div>
+
+      <div id="thinking-bar" class="thinking-bar hidden"></div>
+
+      <form id="nudge-form" class="nudge-bar">
+        <input
+          id="nudge-input"
+          type="text"
+          placeholder="Drop a live mid-debate twist or directive (Creator Interjection)..."
+          autocomplete="off"
+          disabled
+        />
+        <button id="btn-nudge" type="submit" class="btn btn-amber" disabled>
+          Interject
+        </button>
+      </form>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
