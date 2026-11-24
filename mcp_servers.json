@@ -1,0 +1,16 @@
+{
+  "servers": {
+    "search": {
+      "enabled": true,
+      "command": "python",
+      "args": ["mcp_servers/search_server.py"],
+      "description": "Live web search using Tavily with automatic DuckDuckGo fallback"
+    },
+    "utility": {
+      "enabled": true,
+      "command": "python",
+      "args": ["mcp_servers/utility_server.py"],
+      "description": "Real-time date/time lookup and safe mathematical calculator"
+    }
+  }
+}

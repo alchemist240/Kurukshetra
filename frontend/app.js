@@ -1,6 +1,7 @@
 // --- DOM References ---
 const connBadge = document.getElementById("conn-badge");
 const storageBadge = document.getElementById("storage-badge");
+const mcpBadge = document.getElementById("mcp-badge");
 const turnCounter = document.getElementById("turn-counter");
 const tokenCounter = document.getElementById("token-counter");
 const rosterList = document.getElementById("roster-list");
@@ -157,6 +158,35 @@ function buildAgentCardElement(d) {
   return card;
 }
 
+function buildToolCardElement(d) {
+  const ok = d.ok !== false;
+  const card = document.createElement("div");
+  card.className = `tool-card ${ok ? "" : "error"}`.trim();
+
+  const icon = d.tool_name === "web_search" ? "🔍" : (d.tool_name === "calculate" ? "🧮" : "🕒");
+  const argsJson = d.arguments && Object.keys(d.arguments).length > 0
+    ? JSON.stringify(d.arguments)
+    : "{}";
+  const budgetText = d.tools_used && d.tools_max ? ` · call ${d.tools_used}/${d.tools_max}` : "";
+
+  card.innerHTML = `
+    <div class="tool-header">
+      <div class="tool-title">
+        <span>${icon} ${escapeHtml(d.agent_name)} called</span>
+        <span class="tool-badge">${escapeHtml(d.tool_name)}</span>
+        <span class="turn-tag">MCP: ${escapeHtml(d.server || "local")}</span>
+      </div>
+      <div class="msg-metrics">${d.latency_ms || 0}ms${budgetText}</div>
+    </div>
+    <div class="tool-args">Args: ${escapeHtml(argsJson)}</div>
+    <details class="tool-details">
+      <summary>View live MCP output (${(d.output || "").length} chars)</summary>
+      <pre class="tool-output">${escapeHtml(d.output || "")}</pre>
+    </details>
+  `;
+  return card;
+}
+
 function buildVoteCardElement(d) {
   const approved = Boolean(d.approved);
   const card = document.createElement("div");
@@ -274,7 +304,28 @@ function updateThinkingBar(customMessage = null) {
   thinkingBar.classList.remove("hidden");
 }
 
-// --- History & Replay Functions ---
+// --- MCP Tools & History APIs ---
+async function loadTools() {
+  try {
+    const resp = await fetch("/api/tools");
+    if (!resp.ok) return;
+    const payload = await resp.json();
+    const tools = payload.tools || [];
+    if (tools.length > 0) {
+      mcpBadge.textContent = `MCP: ${tools.length} Tools`;
+      mcpBadge.className = "pill pill-mcp";
+      mcpBadge.title = tools.map((t) => `${t.name} (${t.server})`).join(", ");
+    } else {
+      mcpBadge.textContent = "MCP: Off";
+      mcpBadge.className = "pill";
+      mcpBadge.title = "No MCP tools connected";
+    }
+  } catch {
+    mcpBadge.textContent = "MCP: Off";
+    mcpBadge.className = "pill";
+  }
+}
+
 async function loadHistory() {
   try {
     const resp = await fetch("/api/debates?limit=25");
@@ -342,6 +393,8 @@ async function openReplay(debateId) {
     for (const ev of events) {
       if (ev.type === "agent_message") {
         replayFeed.appendChild(buildAgentCardElement(ev.data));
+      } else if (ev.type === "tool_result") {
+        replayFeed.appendChild(buildToolCardElement(ev.data));
       } else if (ev.type === "user_interjection") {
         replayFeed.appendChild(
           buildSystemCardElement(`👑 Kshitij (Creator Interjection): ${ev.data.message}`, "nudge-card")
@@ -403,6 +456,7 @@ function connectWebSocket() {
   ws.onopen = () => {
     connBadge.textContent = "Live Connected";
     connBadge.className = "pill pill-online";
+    loadTools();
     loadHistory();
   };
 
@@ -429,6 +483,18 @@ function connectWebSocket() {
       case "agent_thinking":
         thinkingAgents.add(data.agent_id);
         renderRoster();
+        updateThinkingBar();
+        break;
+
+      case "tool_calling":
+        updateThinkingBar(
+          `🔍 ${data.agent_name} is calling MCP tool "${data.tool_name}"...`
+        );
+        break;
+
+      case "tool_result":
+        feed.appendChild(buildToolCardElement(data));
+        scrollToBottom(feed);
         updateThinkingBar();
         break;
 

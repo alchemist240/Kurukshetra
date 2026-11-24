@@ -20,6 +20,7 @@
     <div class="topbar-stats">
       <span id="conn-badge" class="pill pill-offline">Connecting...</span>
       <span id="storage-badge" class="pill">Storage: ...</span>
+      <span id="mcp-badge" class="pill">MCP: ...</span>
       <span id="turn-counter" class="pill">Turn: 0 / 0</span>
       <span id="token-counter" class="pill">Tokens: 0</span>
       <button id="btn-rewake" class="btn btn-ghost" title="Ask all 4 agents to greet again">
@@ -46,7 +47,7 @@
         <textarea
           id="topic-input"
           rows="3"
-          placeholder="e.g., Should I upgrade my current laptop or buy a brand new one right now?"
+          placeholder="e.g., Best 12GB VRAM laptop under ₹2 Lakh in India right now?"
         ></textarea>
 
         <div class="row-inline">
@@ -96,7 +97,7 @@
 
       <div id="thinking-bar" class="thinking-bar hidden"></div>
 
-      <!-- Majority-Approved Human Clarification Panel (appears when agents pause to ask you) -->
+      <!-- Majority-Approved Human Clarification Panel -->
       <div id="clarification-panel" class="clarification-panel hidden">
         <div class="clarification-head">
           <span class="clarify-badge">🗳️ CLARIFICATION REQUESTED</span>

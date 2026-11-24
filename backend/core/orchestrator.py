@@ -1,12 +1,17 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 from backend.agents.base import ArenaAgent
 from backend.config import settings
 from backend.core.events import EventBus
 from backend.core.registry import AgentRegistry
 from backend.storage.store import DebateStore
+from backend.tools.mcp_manager import MCPManager
 
 MAX_CLARIFICATIONS_PER_DEBATE = 2
 VOTE_COOLDOWN_TURNS = 2
+MAX_TOOL_CALLS_PER_DEBATE = 8
+TOOL_HISTORY_SLICE_CHARS = 1000
+IST = timezone(timedelta(hours=5, minutes=30))
 
 
 class ArenaOrchestrator:
@@ -17,10 +22,12 @@ class ArenaOrchestrator:
         registry: AgentRegistry,
         event_bus: EventBus,
         store: DebateStore | None = None,
+        mcp_manager: MCPManager | None = None,
     ):
         self.registry = registry
         self.event_bus = event_bus
         self.store = store
+        self.mcp_manager = mcp_manager
 
         self.topic: str = ""
         self.current_debate_id: str | None = None
@@ -128,9 +135,10 @@ class ArenaOrchestrator:
         consensus_votes: dict[str, bool] = {a.agent_id: False for a in active_agents}
         end_reason = "max_turns_reached"
 
-        # Anti-spam tracking for human clarification votes
+        # Anti-spam & safety budget counters
         clarifications_used = 0
         last_vote_turn = -VOTE_COOLDOWN_TURNS
+        tool_calls_used = 0
 
         # Reset stances for a clean tactical slate
         self.registry.reset_stances([a.agent_id for a in active_agents])
@@ -188,10 +196,25 @@ class ArenaOrchestrator:
                     "turn": turn,
                 })
 
-                turn_prompt = self._build_turn_prompt(turn, limit, len(active_agents))
+                # Offer live MCP tools only if connected AND debate still has tool budget left
+                tools_remaining = MAX_TOOL_CALLS_PER_DEBATE - tool_calls_used
+                clarifications_remaining = MAX_CLARIFICATIONS_PER_DEBATE - clarifications_used
+                tools_menu = (
+                    self.mcp_manager.format_tools_for_prompt()
+                    if (self.mcp_manager and self.mcp_manager.has_tools() and tools_remaining > 0)
+                    else ""
+                )
+
+                turn_prompt = self._build_turn_prompt(
+                    turn=turn,
+                    max_turns=limit,
+                    num_agents=len(active_agents),
+                    tools_remaining=tools_remaining if tools_menu else 0,
+                    clarifications_remaining=clarifications_remaining,
+                )
 
                 try:
-                    res = await agent.act(turn_prompt, peers)
+                    res = await agent.act(turn_prompt, peers, tools_menu=tools_menu)
                 except Exception as e:
                     err_payload = {
                         "agent_id": agent.agent_id,
@@ -204,7 +227,83 @@ class ArenaOrchestrator:
                         await self.store.append_event(debate_id, "agent_error", err_payload)
                     continue
 
-                # Record turn in RAM history
+                # --- 1-Step ReAct MCP Tool Execution Loop ---
+                if res.tool_call and self.mcp_manager and tools_remaining > 0:
+                    tool_name = res.tool_call["name"]
+                    tool_args = res.tool_call.get("arguments", {})
+
+                    await self.event_bus.publish("tool_calling", {
+                        "turn": turn,
+                        "agent_id": agent.agent_id,
+                        "agent_name": agent.name,
+                        "tool_name": tool_name,
+                        "arguments": tool_args,
+                    })
+
+                    tool_res = await self.mcp_manager.call_tool(tool_name, tool_args)
+                    tool_calls_used += 1
+
+                    tool_event_payload = {
+                        "turn": turn,
+                        "agent_id": agent.agent_id,
+                        "agent_name": agent.name,
+                        "server": tool_res["server"],
+                        "tool_name": tool_res["tool_name"],
+                        "arguments": tool_res["arguments"],
+                        "ok": tool_res["ok"],
+                        "output": tool_res["output"],
+                        "latency_ms": tool_res["latency_ms"],
+                        "tools_used": tool_calls_used,
+                        "tools_max": MAX_TOOL_CALLS_PER_DEBATE,
+                    }
+
+                    await self.event_bus.publish("tool_result", tool_event_payload)
+                    if self.store and debate_id:
+                        await self.store.append_event(debate_id, "tool_result", tool_event_payload)
+
+                    # Share verified tool data so ALL warriors see the same facts
+                    self.history.append({
+                        "speaker": f"MCP Tool ({tool_name} by {agent.name})",
+                        "stance": "Verified Data",
+                        "message": tool_res["output"][:TOOL_HISTORY_SLICE_CHARS],
+                    })
+
+                    # Pass 2: Hand tool output back to the same warrior (tools_menu="" prevents a 2nd loop)
+                    await self.event_bus.publish("agent_thinking", {
+                        "agent_id": agent.agent_id,
+                        "agent_name": agent.name,
+                        "turn": turn,
+                    })
+
+                    followup_prompt = (
+                        f"{turn_prompt}\n\n"
+                        f"YOUR MCP TOOL CALL ({tool_name} with {tool_args}) RETURNED:\n"
+                        f"{tool_res['output']}\n\n"
+                        "Now deliver your final, grounded argument for this turn using ONLY facts supported above. "
+                        "If the search did not return the specific numbers you wanted, admit that honestly—do NOT "
+                        'invent stats from memory. Keep it sharp and under 90 words. Set "tool_call": null.'
+                    )
+
+                    try:
+                        pass2 = await agent.act(followup_prompt, peers, tools_menu="")
+                        # Sum token & latency cost across both passes so telemetry stays exact
+                        pass2.prompt_tokens += res.prompt_tokens
+                        pass2.completion_tokens += res.completion_tokens
+                        pass2.latency_ms += res.latency_ms
+                        res = pass2
+                    except Exception as e:
+                        err_payload = {
+                            "agent_id": agent.agent_id,
+                            "agent_name": agent.name,
+                            "turn": turn,
+                            "error": f"Post-tool reply failed: {e}",
+                        }
+                        await self.event_bus.publish("agent_error", err_payload)
+                        if self.store and debate_id:
+                            await self.store.append_event(debate_id, "agent_error", err_payload)
+                        continue
+
+                # Record final grounded turn in RAM history
                 self.history.append({
                     "turn": turn,
                     "speaker": res.agent_name,
@@ -267,7 +366,6 @@ class ArenaOrchestrator:
                             else "Skipped by Kshitij — make reasonable assumptions and continue."
                         )
 
-                        # Inject Kshitij's answer into history & reset consensus so everyone reacts
                         self.history.append({
                             "speaker": "Kshitij (Clarification)",
                             "stance": "Skipped" if skipped else "Clarification",
@@ -286,7 +384,6 @@ class ArenaOrchestrator:
                         if self.store and debate_id:
                             await self.store.append_event(debate_id, "clarification_answered", ans_payload)
 
-                        # Move directly to next turn with Kshitij's new context in hand
                         continue
                     else:
                         await self.event_bus.publish("clarification_rejected", vote_result)
@@ -350,7 +447,6 @@ class ArenaOrchestrator:
         recent_transcript = self._format_recent_transcript(limit=6)
         other_agents = [a for a in active_agents if a.agent_id != requester.agent_id]
 
-        # Fire all peer votes at the exact same moment (~1.5s total)
         peer_votes = await asyncio.gather(*[
             peer.vote_on_clarification(
                 topic=self.topic,
@@ -361,7 +457,6 @@ class ArenaOrchestrator:
             for peer in other_agents
         ])
 
-        # Requester automatically counts as 1 YES vote
         all_votes = [
             {
                 "agent_id": requester.agent_id,
@@ -375,7 +470,7 @@ class ArenaOrchestrator:
         ]
 
         total_voters = len(active_agents)
-        required = (total_voters // 2) + 1  # 2->2, 3->2, 4->3
+        required = (total_voters // 2) + 1
         yes_votes = sum(1 for v in all_votes if v["vote"])
         vote_tokens = sum(v["prompt_tokens"] + v["completion_tokens"] for v in all_votes)
 
@@ -399,14 +494,45 @@ class ArenaOrchestrator:
             for entry in recent
         )
 
-    def _build_turn_prompt(self, turn: int, max_turns: int, num_agents: int) -> str:
+    @staticmethod
+    def _current_date_banner() -> str:
+        now_ist = datetime.now(IST)
+        return now_ist.strftime("%A, %B %d, %Y (%H:%M IST)")
+
+    def _build_turn_prompt(
+        self,
+        turn: int,
+        max_turns: int,
+        num_agents: int,
+        tools_remaining: int = 0,
+        clarifications_remaining: int = MAX_CLARIFICATIONS_PER_DEBATE,
+    ) -> str:
         """Builds the live context each warrior sees before taking its turn."""
+        date_line = f"CURRENT REAL-WORLD DATE: {self._current_date_banner()}"
+
+        tool_hint = (
+            f"5. LIVE TOOLS ({tools_remaining} arena calls left): Use web_search or calculate "
+            "instead of guessing current prices, recent trades/releases, stats, or math."
+            if tools_remaining > 0
+            else ""
+        )
+
+        clarify_hint = (
+            f"4. HUMAN CLARIFICATIONS LEFT ({clarifications_remaining}): Only set needs_human_input=true "
+            "if a missing personal detail from Kshitij genuinely blocks a tailored answer."
+            if clarifications_remaining > 0
+            else "4. HUMAN CLARIFICATION BUDGET IS 0: Do NOT ask Kshitij any more questions or set "
+            "needs_human_input=true—state a clear assumption and drive toward a concrete verdict."
+        )
+
         if not self.history:
             return (
+                f"{date_line}\n"
                 f"DEBATE TOPIC (from Kshitij): {self.topic}\n"
                 f"Turn {turn} of {max_turns}. You are opening the debate.\n"
-                "Take a bold, clear opening stance and lay down your thesis for the other agents to challenge."
-            )
+                "Take a bold, clear opening stance and lay down your thesis for the other agents to challenge.\n"
+                f"{tool_hint}"
+            ).strip()
 
         transcript = self._format_recent_transcript(limit=10)
 
@@ -417,6 +543,7 @@ class ArenaOrchestrator:
         )
 
         return (
+            f"{date_line}\n"
             f"DEBATE TOPIC: {self.topic}\n"
             f"Turn {turn} of {max_turns}.\n\n"
             f"RECENT ARENA TRANSCRIPT:\n{transcript}\n\n"
@@ -425,5 +552,6 @@ class ArenaOrchestrator:
             "2. Switch your stance dynamically if the room's tone demands it (e.g., use Devil's Advocate if everyone agrees too easily, "
             "Socratic Interrogator to expose holes, or Diplomatic Synthesizer to close a deadlock).\n"
             f"3. {consensus_hint}\n"
-            "4. Only set needs_human_input=true if a missing personal detail from Kshitij genuinely blocks the room from giving a tailored answer."
-        )
+            f"{clarify_hint}\n"
+            f"{tool_hint}"
+        ).strip()

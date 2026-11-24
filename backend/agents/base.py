@@ -27,6 +27,7 @@ class AgentResponse(BaseModel):
     consensus_reached: bool = False
     needs_human_input: bool = False
     question_for_user: str = ""
+    tool_call: dict[str, Any] | None = None
     prompt_tokens: int = 0
     completion_tokens: int = 0
     latency_ms: int = 0
@@ -42,12 +43,33 @@ class ArenaAgent(ABC):
         self.model = model
         self.current_stance: Stance | None = None
 
-    def _build_system_prompt(self, peers: list[dict[str, str]]) -> str:
+    def _build_system_prompt(
+        self,
+        peers: list[dict[str, str]],
+        tools_menu: str = "",
+    ) -> str:
         peer_lines = "\n".join(
             f"- {p['name']} ({p['provider']} / {p['model']}) — current stance: {p['stance']}"
             for p in peers
             if p["agent_id"] != self.agent_id
         ) or "- None yet (you are first in the arena)"
+
+        if tools_menu:
+            tools_section = f"""AVAILABLE LIVE MCP TOOLS:
+{tools_menu}
+
+6. TOOL USAGE: If verifying a real-world fact, current year/date, live price, recent trade,
+   player nationality/status, benchmark, or math calculation will make your argument stronger
+   or fact-check a rival, set "tool_call" to:
+   {{"name": "<exact_tool_name>", "arguments": {{...}}}}
+   - Write ONE focused query per search (one subject/player/claim) with domain + year keywords
+     (e.g., "MI Hardik Pandya Arshdeep Singh trade IPL 2027" instead of mixing multiple questions).
+   - When calling a tool, keep "message" brief (e.g., "Verifying live data...") and set
+     "consensus_reached": false and "needs_human_input": false. Otherwise set "tool_call": null."""
+        else:
+            tools_section = (
+                '6. TOOL USAGE: No tools are available on this pass. Always set "tool_call": null.'
+            )
 
         return f"""You are {self.name}, an autonomous AI warrior inside the 'Kurukshetra' Multi-Agent Arena.
 Your identity: Provider = {self.provider}, Model = {self.model}.
@@ -67,9 +89,13 @@ RULES:
    the group has reached a solid conclusion. (Always false during initial greetings.)
 5. HUMAN CLARIFICATION: Set "needs_human_input" to true ONLY during an active debate when a
    critical personal detail from Kshitij (e.g., budget, exact weak points, constraints, goals)
-   is genuinely missing and blocks a meaningful recommendation. Put ONE concise question in
-   "question_for_user". Otherwise keep "needs_human_input": false and "question_for_user": "".
-   (Always false during initial greetings.)
+   is genuinely missing and blocks a meaningful recommendation—and ONLY if clarification budget
+   remains. Put ONE concise question in "question_for_user". Otherwise keep
+   "needs_human_input": false and "question_for_user": "". (Always false during greetings.)
+{tools_section}
+7. ANTI-HALLUCINATION: NEVER fabricate statistics, prices, specs, or player facts from memory
+   if a web search returns no relevant data. If a tool fails to find numbers, admit it plainly.
+   Double-check questionable claims made by rival agents instead of blindly adopting them.
 
 You MUST respond ONLY with valid JSON in this exact format:
 {{
@@ -78,16 +104,18 @@ You MUST respond ONLY with valid JSON in this exact format:
   "message": "Your public message to the user or other agents",
   "consensus_reached": false,
   "needs_human_input": false,
-  "question_for_user": ""
+  "question_for_user": "",
+  "tool_call": null
 }}"""
 
     async def act(
         self,
         user_prompt: str,
         peers: list[dict[str, str]],
+        tools_menu: str = "",
     ) -> AgentResponse:
         """Runs one full turn: builds prompt -> calls provider API -> parses decision."""
-        system_prompt = self._build_system_prompt(peers)
+        system_prompt = self._build_system_prompt(peers, tools_menu=tools_menu)
         start = time.perf_counter()
 
         try:
@@ -107,7 +135,10 @@ You MUST respond ONLY with valid JSON in this exact format:
         chosen_stance = self._safe_stance(data.get("stance"))
         self.current_stance = chosen_stance
 
-        needs_input = bool(data.get("needs_human_input", False))
+        # Only accept a tool_call when tools were actually offered on this pass
+        parsed_tool_call = self._safe_tool_call(data.get("tool_call")) if tools_menu else None
+
+        needs_input = bool(data.get("needs_human_input", False)) and not parsed_tool_call
         question = str(data.get("question_for_user", "")).strip() if needs_input else ""
         if not question:
             needs_input = False
@@ -121,9 +152,10 @@ You MUST respond ONLY with valid JSON in this exact format:
             stance_color=get_stance_color(chosen_stance),
             reasoning=str(data.get("reasoning", "Default tactical choice.")),
             message=str(data.get("message", raw_text)).strip(),
-            consensus_reached=bool(data.get("consensus_reached", False)),
+            consensus_reached=bool(data.get("consensus_reached", False)) and not parsed_tool_call,
             needs_human_input=needs_input,
             question_for_user=question,
+            tool_call=parsed_tool_call,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             latency_ms=latency_ms,
@@ -151,7 +183,7 @@ You MUST respond ONLY with valid JSON in this exact format:
         vote_user = (
             f"TOPIC: {topic}\n\n"
             f"RECENT TRANSCRIPT:\n{recent_transcript}\n\n"
-            f"PROPOSAL BY {requester_name}: Pause and ask Kshitij -> \"{question}\"\n"
+            f'PROPOSAL BY {requester_name}: Pause and ask Kshitij -> "{question}"\n'
             "Do you vote YES (true) or NO (false)?"
         )
 
@@ -170,7 +202,6 @@ You MUST respond ONLY with valid JSON in this exact format:
                 "completion_tokens": completion_tokens,
             }
         except Exception as e:
-            # If a voter times out or errors, count as NO so it never blocks the arena
             return {
                 "agent_id": self.agent_id,
                 "agent_name": self.name,
@@ -210,3 +241,16 @@ You MUST respond ONLY with valid JSON in this exact format:
             if str(value).strip().lower() == s.value.lower():
                 return s
         return Stance.ASSERTIVE
+
+    @staticmethod
+    def _safe_tool_call(value: Any) -> dict[str, Any] | None:
+        """Validates an optional tool_call object from model JSON."""
+        if not isinstance(value, dict):
+            return None
+        name = str(value.get("name", "")).strip()
+        if not name:
+            return None
+        args = value.get("arguments")
+        if not isinstance(args, dict):
+            args = {}
+        return {"name": name, "arguments": args}

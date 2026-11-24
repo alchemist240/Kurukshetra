@@ -13,16 +13,23 @@ from backend.core.events import EventBus
 from backend.core.registry import AgentRegistry
 from backend.core.orchestrator import ArenaOrchestrator
 from backend.storage.store import DebateStore
+from backend.tools.mcp_manager import MCPManager
 
-# 1. Boot shared EventBus, AgentRegistry, DebateStore, and Orchestrator
+# 1. Boot shared EventBus, AgentRegistry, DebateStore, MCPManager, and Orchestrator
 event_bus = EventBus()
 registry = AgentRegistry()
 store = DebateStore()
+mcp_manager = MCPManager()
 
 for agent in [GroqAgent(), GeminiAgent(), OpenAIAgent(), DeepSeekAgent()]:
     registry.register(agent)
 
-orchestrator = ArenaOrchestrator(registry, event_bus, store=store)
+orchestrator = ArenaOrchestrator(
+    registry,
+    event_bus,
+    store=store,
+    mcp_manager=mcp_manager,
+)
 
 # Track running background tasks so we never overlap two debates or two wake-ups
 active_debate_task: asyncio.Task | None = None
@@ -31,10 +38,14 @@ active_wakeup_task: asyncio.Task | None = None
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Connects to Redis on startup and cleanly closes the pool on shutdown."""
+    """Connects Redis and all MCP servers on startup; closes both cleanly on shutdown."""
     await store.connect()
-    yield
-    await store.close()
+    await mcp_manager.connect_all()
+    try:
+        yield
+    finally:
+        await mcp_manager.close_all()
+        await store.close()
 
 
 # 2. Initialize FastAPI with lifespan and mount frontend static assets
@@ -53,12 +64,18 @@ def trigger_wakeup() -> None:
     active_wakeup_task = asyncio.create_task(orchestrator.wake_up_arena())
 
 
-# --- HTTP Routes (UI + Debate History API) ---
+# --- HTTP Routes (UI + History API + MCP Tools API) ---
 
 @app.get("/")
 async def serve_arena_ui():
     """Serves the main HTML page when you open http://127.0.0.1:8000."""
     return FileResponse(FRONTEND_DIR / "index.html")
+
+
+@app.get("/api/tools")
+async def list_mcp_tools():
+    """Returns all live tools dynamically discovered from connected MCP servers."""
+    return {"tools": mcp_manager.list_tools()}
 
 
 @app.get("/api/debates")

@@ -12,6 +12,7 @@ class Settings:
     gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
     deepseek_api_key: str = os.getenv("DEEPSEEK_API_KEY", "")
+    tavily_api_key: str = os.getenv("TAVILY_API_KEY", "")
 
     groq_model: str = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
     gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
