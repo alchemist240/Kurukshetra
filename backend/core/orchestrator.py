@@ -3,16 +3,24 @@ from backend.agents.base import ArenaAgent
 from backend.config import settings
 from backend.core.events import EventBus
 from backend.core.registry import AgentRegistry
+from backend.storage.store import DebateStore
 
 
 class ArenaOrchestrator:
     """Runs zero-prompt wake-ups and autonomous multi-agent debates."""
 
-    def __init__(self, registry: AgentRegistry, event_bus: EventBus):
+    def __init__(
+        self,
+        registry: AgentRegistry,
+        event_bus: EventBus,
+        store: DebateStore | None = None,
+    ):
         self.registry = registry
         self.event_bus = event_bus
+        self.store = store
 
         self.topic: str = ""
+        self.current_debate_id: str | None = None
         self.history: list[dict] = []
         self.is_running: bool = False
 
@@ -101,13 +109,26 @@ class ArenaOrchestrator:
         consensus_votes: dict[str, bool] = {a.agent_id: False for a in active_agents}
         end_reason = "max_turns_reached"
 
+        # Reset stances for a clean tactical slate
         self.registry.reset_stances([a.agent_id for a in active_agents])
+        active_roster = self.registry.get_peer_roster([a.agent_id for a in active_agents])
         await self.event_bus.publish("roster_update", {"agents": self.registry.get_peer_roster()})
 
+        # Create persistent debate record in Redis + local JSON
+        debate_id: str | None = None
+        if self.store:
+            debate_id = await self.store.create_debate(
+                topic=self.topic,
+                agents=active_roster,
+                max_turns=limit,
+            )
+        self.current_debate_id = debate_id
+
         await self.event_bus.publish("debate_started", {
+            "debate_id": debate_id,
             "topic": self.topic,
             "max_turns": limit,
-            "agents": self.registry.get_peer_roster([a.agent_id for a in active_agents]),
+            "agents": active_roster,
         })
 
         try:
@@ -129,9 +150,11 @@ class ArenaOrchestrator:
                 while self._pending_nudges:
                     nudge = self._pending_nudges.pop(0)
                     self.history.append({"speaker": "Kshitij (Creator)", "stance": "Directive", "message": nudge})
-                    # A new human twist resets consensus so agents must react to it
                     consensus_votes = {a.agent_id: False for a in active_agents}
-                    await self.event_bus.publish("user_interjection", {"message": nudge})
+                    nudge_payload = {"message": nudge}
+                    await self.event_bus.publish("user_interjection", nudge_payload)
+                    if self.store and debate_id:
+                        await self.store.append_event(debate_id, "user_interjection", nudge_payload)
 
                 agent = active_agents[(turn - 1) % len(active_agents)]
                 peers = self.registry.get_peer_roster([a.agent_id for a in active_agents])
@@ -147,15 +170,18 @@ class ArenaOrchestrator:
                 try:
                     res = await agent.act(turn_prompt, peers)
                 except Exception as e:
-                    await self.event_bus.publish("agent_error", {
+                    err_payload = {
                         "agent_id": agent.agent_id,
                         "agent_name": agent.name,
                         "turn": turn,
                         "error": str(e),
-                    })
+                    }
+                    await self.event_bus.publish("agent_error", err_payload)
+                    if self.store and debate_id:
+                        await self.store.append_event(debate_id, "agent_error", err_payload)
                     continue
 
-                # Record turn and broadcast live to UI (and Phase 2 subscribers)
+                # Record turn in RAM history
                 self.history.append({
                     "turn": turn,
                     "speaker": res.agent_name,
@@ -168,6 +194,10 @@ class ArenaOrchestrator:
                 payload["max_turns"] = limit
                 payload["phase"] = "debate"
 
+                # Persist turn to Redis + JSON and broadcast live to UI
+                if self.store and debate_id:
+                    await self.store.append_event(debate_id, "agent_message", payload)
+
                 await self.event_bus.publish("agent_message", payload)
                 await self.event_bus.publish("roster_update", {"agents": self.registry.get_peer_roster()})
 
@@ -178,14 +208,23 @@ class ArenaOrchestrator:
                         end_reason = "consensus_reached"
                         break
 
-                # Brief pacing pause so you can read live and hit Pause/Nudge comfortably
                 await asyncio.sleep(0.8)
 
         finally:
             self.is_running = False
+            completed_turns = len([h for h in self.history if "turn" in h])
+
+            if self.store and debate_id:
+                await self.store.finish_debate(
+                    debate_id=debate_id,
+                    end_reason=end_reason,
+                    total_turns=completed_turns,
+                )
+
             await self.event_bus.publish("debate_ended", {
+                "debate_id": debate_id,
                 "reason": end_reason,
-                "total_turns": len([h for h in self.history if "turn" in h]),
+                "total_turns": completed_turns,
                 "topic": self.topic,
             })
 
@@ -198,7 +237,6 @@ class ArenaOrchestrator:
                 "Take a bold, clear opening stance and lay down your thesis for the other agents to challenge."
             )
 
-        # Keep the last 10 turns so token cost stays low and focus stays razor sharp
         recent = self.history[-10:]
         transcript = "\n".join(
             f"- {entry['speaker']} [{entry['stance']}]: {entry['message']}"

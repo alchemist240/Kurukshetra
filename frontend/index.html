@@ -19,6 +19,7 @@
 
     <div class="topbar-stats">
       <span id="conn-badge" class="pill pill-offline">Connecting...</span>
+      <span id="storage-badge" class="pill">Storage: ...</span>
       <span id="turn-counter" class="pill">Turn: 0 / 0</span>
       <span id="token-counter" class="pill">Tokens: 0</span>
       <button id="btn-rewake" class="btn btn-ghost" title="Ask all 4 agents to greet again">
@@ -29,16 +30,14 @@
 
   <!-- Main Two-Column Arena -->
   <main class="layout">
-    <!-- Left Sidebar: Roster + Controls -->
+    <!-- Left Sidebar: Roster + Launch Controls + Past Debates -->
     <aside class="sidebar">
       <section class="panel">
         <div class="panel-header">
           <h2>Arena Warriors</h2>
           <span class="hint">Check 2–4 to debate</span>
         </div>
-        <div id="roster-list" class="roster-list">
-          <!-- Dynamically populated via WebSocket roster_update -->
-        </div>
+        <div id="roster-list" class="roster-list"></div>
       </section>
 
       <section class="panel">
@@ -65,18 +64,35 @@
           <button id="btn-stop" class="btn btn-danger" disabled>Stop</button>
         </div>
       </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <h2>Past Debates</h2>
+          <button id="btn-refresh-history" class="btn btn-ghost btn-sm" title="Refresh saved debates">
+            ↻ Refresh
+          </button>
+        </div>
+        <div id="history-list" class="history-list">
+          <div class="history-empty">Loading history...</div>
+        </div>
+      </section>
     </aside>
 
-    <!-- Right Stage: Live Debate Feed + Interject Bar -->
+    <!-- Right Stage: Live Debate Feed + Replay Feed + Interject Bar -->
     <section class="stage">
       <div id="topic-banner" class="topic-banner hidden">
         <span id="stage-status" class="status-tag">LIVE</span>
-        <span id="active-topic-text"></span>
+        <span id="active-topic-text" class="topic-text"></span>
+        <button id="btn-back-live" class="btn btn-ghost btn-sm hidden">
+          ← Back to Live
+        </button>
       </div>
 
-      <div id="feed" class="feed">
-        <!-- Live agent cards, reasoning boxes, and system notices appear here -->
-      </div>
+      <!-- Live feed (active session) -->
+      <div id="feed" class="feed"></div>
+
+      <!-- Replay feed (shown only when inspecting a saved debate) -->
+      <div id="replay-feed" class="feed hidden"></div>
 
       <div id="thinking-bar" class="thinking-bar hidden"></div>
 

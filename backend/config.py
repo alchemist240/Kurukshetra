@@ -19,6 +19,7 @@ class Settings:
     deepseek_model: str = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
     max_debate_turns: int = int(os.getenv("MAX_DEBATE_TURNS", "12"))
+    redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 
 settings = Settings()

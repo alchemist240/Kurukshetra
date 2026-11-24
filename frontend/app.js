@@ -1,13 +1,19 @@
 // --- DOM References ---
 const connBadge = document.getElementById("conn-badge");
+const storageBadge = document.getElementById("storage-badge");
 const turnCounter = document.getElementById("turn-counter");
 const tokenCounter = document.getElementById("token-counter");
 const rosterList = document.getElementById("roster-list");
+const historyList = document.getElementById("history-list");
+const btnRefreshHistory = document.getElementById("btn-refresh-history");
+
 const feed = document.getElementById("feed");
+const replayFeed = document.getElementById("replay-feed");
 const thinkingBar = document.getElementById("thinking-bar");
 const topicBanner = document.getElementById("topic-banner");
 const stageStatus = document.getElementById("stage-status");
 const activeTopicText = document.getElementById("active-topic-text");
+const btnBackLive = document.getElementById("btn-back-live");
 
 const topicInput = document.getElementById("topic-input");
 const maxTurnsInput = document.getElementById("max-turns-input");
@@ -23,11 +29,15 @@ const btnNudge = document.getElementById("btn-nudge");
 // --- Frontend State ---
 let ws = null;
 let latestRoster = [];
-let selectedAgents = new Set(); // Remembers your checkbox picks across roster updates
-let thinkingAgents = new Set(); // Tracks who is currently calling their API
-let agentTokens = {};           // Cumulative tokens per warrior
+let selectedAgents = new Set();
+let thinkingAgents = new Set();
+let agentTokens = {};
 let totalTokens = 0;
 let isDebating = false;
+
+// Live banner snapshot so we can restore it cleanly after closing a replay
+let liveBannerState = { visible: false, statusText: "LIVE", statusBg: "#3b82f6", topic: "" };
+let viewingReplayId = null;
 
 // --- Helpers ---
 function escapeHtml(str) {
@@ -38,8 +48,8 @@ function escapeHtml(str) {
     .replace(/"/g, "&quot;");
 }
 
-function scrollFeedToBottom() {
-  feed.scrollTop = feed.scrollHeight;
+function scrollToBottom(el) {
+  el.scrollTop = el.scrollHeight;
 }
 
 function sendCommand(payload) {
@@ -59,7 +69,89 @@ function setControlsState({ debating, paused = false }) {
   btnNudge.disabled = !debating;
 }
 
-// --- Render Functions ---
+function applyBanner({ visible, statusText, statusBg, topic, showBackBtn = false }) {
+  if (!visible) {
+    topicBanner.classList.add("hidden");
+    return;
+  }
+  topicBanner.classList.remove("hidden");
+  stageStatus.textContent = statusText;
+  stageStatus.style.background = statusBg;
+  activeTopicText.textContent = topic;
+  btnBackLive.classList.toggle("hidden", !showBackBtn);
+}
+
+function updateLiveBanner(patch) {
+  liveBannerState = { ...liveBannerState, ...patch };
+  if (!viewingReplayId) {
+    applyBanner({ ...liveBannerState, showBackBtn: false });
+  }
+}
+
+// --- Shared Card Builders (used by BOTH Live Feed and Replay Feed) ---
+function buildAgentCardElement(d) {
+  const isDebate = d.phase === "debate" || d.turn !== undefined;
+  const turnLabel = isDebate
+    ? (d.max_turns ? `Turn ${d.turn}/${d.max_turns}` : `Turn ${d.turn}`)
+    : "WAKE-UP";
+  const usedTokens = (d.prompt_tokens || 0) + (d.completion_tokens || 0);
+  const color = d.stance_color || "#3b82f6";
+
+  const card = document.createElement("article");
+  card.className = "msg-card";
+  card.style.borderLeftColor = color;
+
+  const modelHtml = d.model ? `<span class="model-tag">${escapeHtml(d.model)}</span>` : "";
+  const reasoningHtml = d.reasoning
+    ? `<div class="reasoning-box"><span class="reasoning-label">Tactical Reasoning:</span> ${escapeHtml(d.reasoning)}</div>`
+    : "";
+  const latencyText = d.latency_ms ? `${d.latency_ms}ms · ` : "";
+
+  card.innerHTML = `
+    <div class="msg-header">
+      <div class="msg-title">
+        <span class="agent-name">${escapeHtml(d.agent_name || d.agent_id)}</span>
+        ${modelHtml}
+        <span class="stance-badge" style="background: ${color}">${escapeHtml(d.stance || "Assertive")}</span>
+        <span class="turn-tag">${escapeHtml(turnLabel)}</span>
+        ${d.consensus_reached ? `<span class="consensus-tag">✓ AGREED</span>` : ""}
+      </div>
+      <div class="msg-metrics">${latencyText}${usedTokens} tok</div>
+    </div>
+    ${reasoningHtml}
+    <div class="msg-body">${escapeHtml(d.message)}</div>
+  `;
+  return card;
+}
+
+function buildSystemCardElement(text, extraClass = "") {
+  const div = document.createElement("div");
+  div.className = `system-card ${extraClass}`.trim();
+  div.textContent = text;
+  return div;
+}
+
+function appendAgentCard(d) {
+  const isDebate = d.phase === "debate";
+  const usedTokens = (d.prompt_tokens || 0) + (d.completion_tokens || 0);
+
+  agentTokens[d.agent_id] = (agentTokens[d.agent_id] || 0) + usedTokens;
+  totalTokens += usedTokens;
+  tokenCounter.textContent = `Tokens: ${totalTokens.toLocaleString()}`;
+  if (isDebate) {
+    turnCounter.textContent = `Turn: ${d.turn} / ${d.max_turns}`;
+  }
+
+  feed.appendChild(buildAgentCardElement(d));
+  scrollToBottom(feed);
+}
+
+function appendSystemCard(text, extraClass = "") {
+  feed.appendChild(buildSystemCardElement(text, extraClass));
+  scrollToBottom(feed);
+}
+
+// --- Roster & Thinking Renderers ---
 function renderRoster() {
   rosterList.innerHTML = latestRoster
     .map((a) => {
@@ -86,7 +178,6 @@ function renderRoster() {
     })
     .join("");
 
-  // Re-attach checkbox listeners
   document.querySelectorAll(".agent-checkbox").forEach((box) => {
     box.addEventListener("change", (e) => {
       const id = e.target.dataset.id;
@@ -97,7 +188,7 @@ function renderRoster() {
 }
 
 function updateThinkingBar() {
-  if (thinkingAgents.size === 0) {
+  if (thinkingAgents.size === 0 || viewingReplayId) {
     thinkingBar.classList.add("hidden");
     thinkingBar.textContent = "";
     return;
@@ -109,51 +200,120 @@ function updateThinkingBar() {
   thinkingBar.classList.remove("hidden");
 }
 
-function appendAgentCard(d) {
-  const isDebate = d.phase === "debate";
-  const turnLabel = isDebate ? `Turn ${d.turn}/${d.max_turns}` : "WAKE-UP";
-  const usedTokens = (d.prompt_tokens || 0) + (d.completion_tokens || 0);
+// --- History & Replay Functions ---
+async function loadHistory() {
+  try {
+    const resp = await fetch("/api/debates?limit=25");
+    if (!resp.ok) return;
+    const payload = await resp.json();
 
-  // Update live token stats
-  agentTokens[d.agent_id] = (agentTokens[d.agent_id] || 0) + usedTokens;
-  totalTokens += usedTokens;
-  tokenCounter.textContent = `Tokens: ${totalTokens.toLocaleString()}`;
-  if (isDebate) {
-    turnCounter.textContent = `Turn: ${d.turn} / ${d.max_turns}`;
+    // Update topbar storage indicator
+    if (payload.redis_available) {
+      storageBadge.textContent = "Redis + JSON";
+      storageBadge.className = "pill pill-redis";
+    } else {
+      storageBadge.textContent = "JSON Only";
+      storageBadge.className = "pill";
+    }
+
+    const debates = payload.debates || [];
+    if (debates.length === 0) {
+      historyList.innerHTML = `<div class="history-empty">No saved debates yet.</div>`;
+      return;
+    }
+
+    historyList.innerHTML = debates
+      .map((d) => {
+        const activeClass = d.debate_id === viewingReplayId ? "active" : "";
+        const srcClass = d.source === "json" ? "json" : "";
+        const reasonTag = d.end_reason === "consensus_reached" ? "✓ Consensus" : (d.status === "running" ? "● Live" : `${d.total_turns}t`);
+
+        return `
+          <div class="history-item ${activeClass}" data-id="${escapeHtml(d.debate_id)}">
+            <div class="history-topic">${escapeHtml(d.topic)}</div>
+            <div class="history-meta">
+              <span>${reasonTag} · ${Number(d.total_tokens || 0).toLocaleString()} tok</span>
+              <span class="source-tag ${srcClass}">${escapeHtml(d.source || "json")}</span>
+            </div>
+          </div>
+        `;
+      })
+      .join("");
+
+    document.querySelectorAll(".history-item").forEach((el) => {
+      el.addEventListener("click", () => openReplay(el.dataset.id));
+    });
+  } catch (err) {
+    historyList.innerHTML = `<div class="history-empty">Failed to load history.</div>`;
   }
-
-  const card = document.createElement("article");
-  card.className = "msg-card";
-  card.style.borderLeftColor = d.stance_color || "#3b82f6";
-
-  card.innerHTML = `
-    <div class="msg-header">
-      <div class="msg-title">
-        <span class="agent-name">${escapeHtml(d.agent_name)}</span>
-        <span class="model-tag">${escapeHtml(d.model)}</span>
-        <span class="stance-badge" style="background: ${d.stance_color}">${escapeHtml(d.stance)}</span>
-        <span class="turn-tag">${escapeHtml(turnLabel)}</span>
-        ${d.consensus_reached ? `<span class="consensus-tag">✓ AGREED</span>` : ""}
-      </div>
-      <div class="msg-metrics">${d.latency_ms}ms · ${usedTokens} tok</div>
-    </div>
-    <div class="reasoning-box">
-      <span class="reasoning-label">Tactical Reasoning:</span>
-      ${escapeHtml(d.reasoning)}
-    </div>
-    <div class="msg-body">${escapeHtml(d.message)}</div>
-  `;
-
-  feed.appendChild(card);
-  scrollFeedToBottom();
 }
 
-function appendSystemCard(text, extraClass = "") {
-  const div = document.createElement("div");
-  div.className = `system-card ${extraClass}`.trim();
-  div.textContent = text;
-  feed.appendChild(div);
-  scrollFeedToBottom();
+async function openReplay(debateId) {
+  try {
+    const resp = await fetch(`/api/debates/${encodeURIComponent(debateId)}`);
+    if (!resp.ok) return;
+    const doc = await resp.json();
+    const meta = doc.meta || {};
+    const events = doc.events || [];
+
+    viewingReplayId = debateId;
+    replayFeed.innerHTML = "";
+
+    const agentNames = (meta.agents || []).map((a) => a.name || a.agent_id).join(" vs ");
+    replayFeed.appendChild(
+      buildSystemCardElement(
+        `📼 Replay loaded from ${String(doc.source || "json").toUpperCase()} — ${agentNames || "Arena"} · ${meta.total_turns || 0} turns · ${Number(meta.total_tokens || 0).toLocaleString()} tokens`
+      )
+    );
+
+    for (const ev of events) {
+      if (ev.type === "agent_message") {
+        replayFeed.appendChild(buildAgentCardElement(ev.data));
+      } else if (ev.type === "user_interjection") {
+        replayFeed.appendChild(
+          buildSystemCardElement(`👑 Kshitij (Creator Interjection): ${ev.data.message}`, "nudge-card")
+        );
+      } else if (ev.type === "agent_error") {
+        replayFeed.appendChild(
+          buildSystemCardElement(`⚠️ ${ev.data.agent_name} error: ${ev.data.error}`, "error-card")
+        );
+      }
+    }
+
+    if (meta.end_reason) {
+      replayFeed.appendChild(
+        buildSystemCardElement(`🏁 Debate ended — ${meta.end_reason.replaceAll("_", " ").toUpperCase()}`)
+      );
+    }
+
+    // Swap visible stage from Live -> Replay
+    feed.classList.add("hidden");
+    replayFeed.classList.remove("hidden");
+    thinkingBar.classList.add("hidden");
+
+    applyBanner({
+      visible: true,
+      statusText: `REPLAY (${String(doc.source || "json").toUpperCase()})`,
+      statusBg: "#0891b2",
+      topic: meta.topic || debateId,
+      showBackBtn: true,
+    });
+
+    replayFeed.scrollTop = 0;
+    loadHistory();
+  } catch (err) {
+    appendSystemCard("⚠️ Could not load saved debate.", "error-card");
+  }
+}
+
+function exitReplay() {
+  viewingReplayId = null;
+  replayFeed.classList.add("hidden");
+  feed.classList.remove("hidden");
+  applyBanner({ ...liveBannerState, showBackBtn: false });
+  updateThinkingBar();
+  scrollToBottom(feed);
+  loadHistory();
 }
 
 // --- WebSocket Connection & Event Router ---
@@ -164,6 +324,7 @@ function connectWebSocket() {
   ws.onopen = () => {
     connBadge.textContent = "Live Connected";
     connBadge.className = "pill pill-online";
+    loadHistory();
   };
 
   ws.onclose = () => {
@@ -179,7 +340,6 @@ function connectWebSocket() {
     switch (type) {
       case "roster_update":
         latestRoster = data.agents || [];
-        // First load: select all warriors by default
         if (selectedAgents.size === 0) {
           latestRoster.forEach((a) => selectedAgents.add(a.agent_id));
         }
@@ -211,26 +371,28 @@ function connectWebSocket() {
         break;
 
       case "debate_started":
+        if (viewingReplayId) exitReplay();
         setControlsState({ debating: true, paused: false });
-        topicBanner.classList.remove("hidden");
-        stageStatus.textContent = "LIVE";
-        stageStatus.style.background = "#3b82f6";
-        activeTopicText.textContent = data.topic;
+        updateLiveBanner({
+          visible: true,
+          statusText: "LIVE",
+          statusBg: "#3b82f6",
+          topic: data.topic,
+        });
         turnCounter.textContent = `Turn: 0 / ${data.max_turns}`;
         appendSystemCard(`🔥 Debate started: "${data.topic}" (${data.agents.map((a) => a.name).join(" vs ")})`);
+        loadHistory();
         break;
 
       case "debate_paused":
         setControlsState({ debating: true, paused: true });
-        stageStatus.textContent = "PAUSED";
-        stageStatus.style.background = "#ca8a04";
+        updateLiveBanner({ statusText: "PAUSED", statusBg: "#ca8a04" });
         appendSystemCard(`⏸️ Debate paused before Turn ${data.turn}.`);
         break;
 
       case "debate_resumed":
         setControlsState({ debating: true, paused: false });
-        stageStatus.textContent = "LIVE";
-        stageStatus.style.background = "#3b82f6";
+        updateLiveBanner({ statusText: "LIVE", statusBg: "#3b82f6" });
         appendSystemCard(`▶️ Debate resumed at Turn ${data.turn}.`);
         break;
 
@@ -250,9 +412,12 @@ function connectWebSocket() {
           stopped_by_user: "STOPPED BY CREATOR",
         };
         const label = labels[data.reason] || data.reason;
-        stageStatus.textContent = label;
-        stageStatus.style.background = data.reason === "consensus_reached" ? "#16a34a" : "#475569";
-        appendSystemCard(`🏁 Debate ended — ${label} (${data.total_turns} turns).`);
+        updateLiveBanner({
+          statusText: label,
+          statusBg: data.reason === "consensus_reached" ? "#16a34a" : "#475569",
+        });
+        appendSystemCard(`🏁 Debate ended — ${label} (${data.total_turns} turns). Saved to Redis & JSON.`);
+        loadHistory();
         break;
       }
 
@@ -290,7 +455,12 @@ btnStart.addEventListener("click", () => {
 btnPause.addEventListener("click", () => sendCommand({ action: "pause" }));
 btnResume.addEventListener("click", () => sendCommand({ action: "resume" }));
 btnStop.addEventListener("click", () => sendCommand({ action: "stop" }));
-btnRewake.addEventListener("click", () => sendCommand({ action: "wake_up" }));
+btnRewake.addEventListener("click", () => {
+  if (viewingReplayId) exitReplay();
+  sendCommand({ action: "wake_up" });
+});
+btnBackLive.addEventListener("click", exitReplay);
+btnRefreshHistory.addEventListener("click", loadHistory);
 
 nudgeForm.addEventListener("submit", (e) => {
   e.preventDefault();
@@ -300,5 +470,5 @@ nudgeForm.addEventListener("submit", (e) => {
   nudgeInput.value = "";
 });
 
-// Boot WebSocket immediately on page load
+// Boot WebSocket & History immediately
 connectWebSocket();
