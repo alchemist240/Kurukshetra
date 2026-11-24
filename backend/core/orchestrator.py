@@ -5,6 +5,9 @@ from backend.core.events import EventBus
 from backend.core.registry import AgentRegistry
 from backend.storage.store import DebateStore
 
+MAX_CLARIFICATIONS_PER_DEBATE = 2
+VOTE_COOLDOWN_TURNS = 2
+
 
 class ArenaOrchestrator:
     """Runs zero-prompt wake-ups and autonomous multi-agent debates."""
@@ -24,11 +27,17 @@ class ArenaOrchestrator:
         self.history: list[dict] = []
         self.is_running: bool = False
 
-        # Traffic-light controls for Pause / Resume / Stop / Mid-debate Nudges
+        # Traffic-light #1: Manual Pause / Resume / Stop / Mid-debate Nudges
         self._resume_event = asyncio.Event()
         self._resume_event.set()  # Green light by default
         self._stop_requested: bool = False
         self._pending_nudges: list[str] = []
+
+        # Traffic-light #2: Majority-Vote Human Clarification Pause
+        self._clarification_event = asyncio.Event()
+        self._clarification_event.set()
+        self.awaiting_clarification: bool = False
+        self._clarification_answer: str = ""
 
     # --- Live Controls (called from WebSocket UI buttons) ---
 
@@ -40,11 +49,19 @@ class ArenaOrchestrator:
 
     def stop(self) -> None:
         self._stop_requested = True
-        self._resume_event.set()  # Unblock immediately if currently paused
+        self._resume_event.set()          # Unblock if manually paused
+        self._clarification_event.set()   # Unblock if waiting for human clarification
 
     def add_user_nudge(self, text: str) -> None:
         if text.strip():
             self._pending_nudges.append(text.strip())
+
+    def submit_clarification(self, answer: str) -> None:
+        """Called when Kshitij answers (or skips) a majority-approved clarification question."""
+        if not self.awaiting_clarification:
+            return
+        self._clarification_answer = answer.strip()
+        self._clarification_event.set()
 
     # --- Mode 1: Zero-Prompt Self-Invoke Wake-Up ---
 
@@ -101,6 +118,8 @@ class ArenaOrchestrator:
         self.is_running = True
         self._stop_requested = False
         self._resume_event.set()
+        self._clarification_event.set()
+        self.awaiting_clarification = False
         self._pending_nudges.clear()
         self.topic = topic.strip()
         self.history = []
@@ -108,6 +127,10 @@ class ArenaOrchestrator:
         limit = max_turns or settings.max_debate_turns
         consensus_votes: dict[str, bool] = {a.agent_id: False for a in active_agents}
         end_reason = "max_turns_reached"
+
+        # Anti-spam tracking for human clarification votes
+        clarifications_used = 0
+        last_vote_turn = -VOTE_COOLDOWN_TURNS
 
         # Reset stances for a clean tactical slate
         self.registry.reset_stances([a.agent_id for a in active_agents])
@@ -137,7 +160,7 @@ class ArenaOrchestrator:
                     end_reason = "stopped_by_user"
                     break
 
-                # If paused, wait cleanly here until Resume or Stop is clicked
+                # If manually paused, wait cleanly here until Resume or Stop is clicked
                 if not self._resume_event.is_set():
                     await self.event_bus.publish("debate_paused", {"turn": turn})
                     await self._resume_event.wait()
@@ -201,6 +224,86 @@ class ArenaOrchestrator:
                 await self.event_bus.publish("agent_message", payload)
                 await self.event_bus.publish("roster_update", {"agents": self.registry.get_peer_roster()})
 
+                # --- Majority-Vote Human-in-the-Loop Clarification Check ---
+                can_vote = (
+                    res.needs_human_input
+                    and bool(res.question_for_user)
+                    and not self._stop_requested
+                    and turn < limit
+                    and clarifications_used < MAX_CLARIFICATIONS_PER_DEBATE
+                    and (turn - last_vote_turn) >= VOTE_COOLDOWN_TURNS
+                )
+
+                if can_vote:
+                    last_vote_turn = turn
+                    vote_result = await self._run_clarification_vote(
+                        requester=agent,
+                        active_agents=active_agents,
+                        question=res.question_for_user,
+                        turn=turn,
+                    )
+
+                    if vote_result["approved"]:
+                        await self.event_bus.publish("clarification_requested", vote_result)
+                        if self.store and debate_id:
+                            await self.store.append_event(debate_id, "clarification_requested", vote_result)
+
+                        # Pause cleanly here until Kshitij replies, skips, or clicks Stop
+                        self.awaiting_clarification = True
+                        self._clarification_answer = ""
+                        self._clarification_event.clear()
+                        await self._clarification_event.wait()
+                        self.awaiting_clarification = False
+
+                        if self._stop_requested:
+                            end_reason = "stopped_by_user"
+                            break
+
+                        clarifications_used += 1
+                        skipped = not bool(self._clarification_answer)
+                        final_answer = (
+                            self._clarification_answer
+                            if not skipped
+                            else "Skipped by Kshitij — make reasonable assumptions and continue."
+                        )
+
+                        # Inject Kshitij's answer into history & reset consensus so everyone reacts
+                        self.history.append({
+                            "speaker": "Kshitij (Clarification)",
+                            "stance": "Skipped" if skipped else "Clarification",
+                            "message": f"Q ({agent.name}): {res.question_for_user} -> A: {final_answer}",
+                        })
+                        consensus_votes = {a.agent_id: False for a in active_agents}
+
+                        ans_payload = {
+                            "turn": turn,
+                            "requester": agent.name,
+                            "question": res.question_for_user,
+                            "answer": final_answer,
+                            "skipped": skipped,
+                        }
+                        await self.event_bus.publish("clarification_answered", ans_payload)
+                        if self.store and debate_id:
+                            await self.store.append_event(debate_id, "clarification_answered", ans_payload)
+
+                        # Move directly to next turn with Kshitij's new context in hand
+                        continue
+                    else:
+                        await self.event_bus.publish("clarification_rejected", vote_result)
+                        if self.store and debate_id:
+                            await self.store.append_event(debate_id, "clarification_rejected", vote_result)
+
+                        self.history.append({
+                            "speaker": "Arena System",
+                            "stance": "Vote Overruled",
+                            "message": (
+                                f"{agent.name}'s request to pause and ask Kshitij "
+                                f"('{res.question_for_user}') was overruled "
+                                f"({vote_result['yes_votes']}/{vote_result['total_voters']} voted YES). "
+                                "State a clear assumption and keep debating."
+                            ),
+                        })
+
                 # Track consensus ONLY after every warrior has spoken at least once
                 if turn >= len(active_agents):
                     consensus_votes[agent.agent_id] = res.consensus_reached
@@ -212,6 +315,7 @@ class ArenaOrchestrator:
 
         finally:
             self.is_running = False
+            self.awaiting_clarification = False
             completed_turns = len([h for h in self.history if "turn" in h])
 
             if self.store and debate_id:
@@ -228,6 +332,73 @@ class ArenaOrchestrator:
                 "topic": self.topic,
             })
 
+    async def _run_clarification_vote(
+        self,
+        requester: ArenaAgent,
+        active_agents: list[ArenaAgent],
+        question: str,
+        turn: int,
+    ) -> dict:
+        """Polls all other active warriors in parallel to decide if Kshitij should be paused."""
+        await self.event_bus.publish("clarification_voting", {
+            "turn": turn,
+            "requester_id": requester.agent_id,
+            "requester_name": requester.name,
+            "question": question,
+        })
+
+        recent_transcript = self._format_recent_transcript(limit=6)
+        other_agents = [a for a in active_agents if a.agent_id != requester.agent_id]
+
+        # Fire all peer votes at the exact same moment (~1.5s total)
+        peer_votes = await asyncio.gather(*[
+            peer.vote_on_clarification(
+                topic=self.topic,
+                requester_name=requester.name,
+                question=question,
+                recent_transcript=recent_transcript,
+            )
+            for peer in other_agents
+        ])
+
+        # Requester automatically counts as 1 YES vote
+        all_votes = [
+            {
+                "agent_id": requester.agent_id,
+                "agent_name": requester.name,
+                "vote": True,
+                "reason": "Proposed this clarification question.",
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+            },
+            *peer_votes,
+        ]
+
+        total_voters = len(active_agents)
+        required = (total_voters // 2) + 1  # 2->2, 3->2, 4->3
+        yes_votes = sum(1 for v in all_votes if v["vote"])
+        vote_tokens = sum(v["prompt_tokens"] + v["completion_tokens"] for v in all_votes)
+
+        return {
+            "turn": turn,
+            "requester_id": requester.agent_id,
+            "requester_name": requester.name,
+            "question": question,
+            "yes_votes": yes_votes,
+            "total_voters": total_voters,
+            "required_votes": required,
+            "approved": yes_votes >= required,
+            "vote_tokens": vote_tokens,
+            "votes": all_votes,
+        }
+
+    def _format_recent_transcript(self, limit: int = 10) -> str:
+        recent = self.history[-limit:]
+        return "\n".join(
+            f"- {entry['speaker']} [{entry['stance']}]: {entry['message']}"
+            for entry in recent
+        )
+
     def _build_turn_prompt(self, turn: int, max_turns: int, num_agents: int) -> str:
         """Builds the live context each warrior sees before taking its turn."""
         if not self.history:
@@ -237,11 +408,7 @@ class ArenaOrchestrator:
                 "Take a bold, clear opening stance and lay down your thesis for the other agents to challenge."
             )
 
-        recent = self.history[-10:]
-        transcript = "\n".join(
-            f"- {entry['speaker']} [{entry['stance']}]: {entry['message']}"
-            for entry in recent
-        )
+        transcript = self._format_recent_transcript(limit=10)
 
         consensus_hint = (
             "Do NOT set consensus_reached=true yet—everyone hasn't even had their opening turn."
@@ -257,5 +424,6 @@ class ArenaOrchestrator:
             "1. Directly address or challenge what the previous agent(s) just argued.\n"
             "2. Switch your stance dynamically if the room's tone demands it (e.g., use Devil's Advocate if everyone agrees too easily, "
             "Socratic Interrogator to expose holes, or Diplomatic Synthesizer to close a deadlock).\n"
-            f"3. {consensus_hint}"
+            f"3. {consensus_hint}\n"
+            "4. Only set needs_human_input=true if a missing personal detail from Kshitij genuinely blocks the room from giving a tailored answer."
         )

@@ -141,6 +141,9 @@ async def arena_websocket(websocket: WebSocket):
             elif action == "nudge":
                 orchestrator.add_user_nudge(str(cmd.get("message", "")))
 
+            elif action == "clarification_reply":
+                orchestrator.submit_clarification(str(cmd.get("answer", "")))
+
             elif action == "wake_up":
                 trigger_wakeup()
 

@@ -26,6 +26,13 @@ const nudgeForm = document.getElementById("nudge-form");
 const nudgeInput = document.getElementById("nudge-input");
 const btnNudge = document.getElementById("btn-nudge");
 
+const clarificationPanel = document.getElementById("clarification-panel");
+const clarificationMeta = document.getElementById("clarification-meta");
+const clarificationQuestion = document.getElementById("clarification-question");
+const clarificationForm = document.getElementById("clarification-form");
+const clarificationInput = document.getElementById("clarification-input");
+const btnClarifySkip = document.getElementById("btn-clarify-skip");
+
 // --- Frontend State ---
 let ws = null;
 let latestRoster = [];
@@ -34,8 +41,8 @@ let thinkingAgents = new Set();
 let agentTokens = {};
 let totalTokens = 0;
 let isDebating = false;
+let awaitingClarification = false;
 
-// Live banner snapshot so we can restore it cleanly after closing a replay
 let liveBannerState = { visible: false, statusText: "LIVE", statusBg: "#3b82f6", topic: "" };
 let viewingReplayId = null;
 
@@ -58,15 +65,16 @@ function sendCommand(payload) {
   }
 }
 
-function setControlsState({ debating, paused = false }) {
+function setControlsState({ debating, paused = false, clarifying = false }) {
   isDebating = debating;
+  awaitingClarification = clarifying;
   btnStart.disabled = debating;
   btnRewake.disabled = debating;
-  btnPause.disabled = !debating || paused;
-  btnResume.disabled = !debating || !paused;
+  btnPause.disabled = !debating || paused || clarifying;
+  btnResume.disabled = !debating || !paused || clarifying;
   btnStop.disabled = !debating;
-  nudgeInput.disabled = !debating;
-  btnNudge.disabled = !debating;
+  nudgeInput.disabled = !debating || clarifying;
+  btnNudge.disabled = !debating || clarifying;
 }
 
 function applyBanner({ visible, statusText, statusBg, topic, showBackBtn = false }) {
@@ -86,6 +94,31 @@ function updateLiveBanner(patch) {
   if (!viewingReplayId) {
     applyBanner({ ...liveBannerState, showBackBtn: false });
   }
+}
+
+function showClarificationPrompt(d) {
+  clarificationMeta.textContent = `Proposed by ${d.requester_name} · Passed ${d.yes_votes}/${d.total_voters} votes`;
+  clarificationQuestion.textContent = d.question;
+  clarificationInput.value = "";
+  clarificationPanel.classList.remove("hidden");
+  clarificationInput.focus();
+}
+
+function hideClarificationPrompt() {
+  clarificationPanel.classList.add("hidden");
+  clarificationInput.value = "";
+}
+
+function recordVoteTokens(d) {
+  const votes = d.votes || [];
+  for (const v of votes) {
+    const used = (v.prompt_tokens || 0) + (v.completion_tokens || 0);
+    if (used > 0) {
+      agentTokens[v.agent_id] = (agentTokens[v.agent_id] || 0) + used;
+      totalTokens += used;
+    }
+  }
+  tokenCounter.textContent = `Tokens: ${totalTokens.toLocaleString()}`;
 }
 
 // --- Shared Card Builders (used by BOTH Live Feed and Replay Feed) ---
@@ -120,6 +153,42 @@ function buildAgentCardElement(d) {
     </div>
     ${reasoningHtml}
     <div class="msg-body">${escapeHtml(d.message)}</div>
+  `;
+  return card;
+}
+
+function buildVoteCardElement(d) {
+  const approved = Boolean(d.approved);
+  const card = document.createElement("div");
+  card.className = `vote-card ${approved ? "" : "rejected"}`.trim();
+
+  const statusLabel = approved
+    ? `🗳️ Majority Vote PASSED (${d.yes_votes}/${d.total_voters}) — Waiting for Kshitij`
+    : `🛡️ Clarification OVERRULED (${d.yes_votes}/${d.total_voters}) — Agents Continuing`;
+
+  const rowsHtml = (d.votes || [])
+    .map((v) => {
+      const chipClass = v.vote ? "yes" : "no";
+      const chipText = v.vote ? "YES" : "NO";
+      return `
+        <div class="vote-row">
+          <span class="vote-chip ${chipClass}">${chipText}</span>
+          <strong>${escapeHtml(v.agent_name)}:</strong>
+          <span>${escapeHtml(v.reason)}</span>
+        </div>
+      `;
+    })
+    .join("");
+
+  card.innerHTML = `
+    <div class="vote-header">
+      <span class="vote-title">${escapeHtml(statusLabel)}</span>
+      <span class="msg-metrics">${Number(d.vote_tokens || 0)} vote tok</span>
+    </div>
+    <div class="vote-question">
+      <strong>${escapeHtml(d.requester_name)} asked:</strong> "${escapeHtml(d.question)}"
+    </div>
+    <div class="vote-list">${rowsHtml}</div>
   `;
   return card;
 }
@@ -187,7 +256,12 @@ function renderRoster() {
   });
 }
 
-function updateThinkingBar() {
+function updateThinkingBar(customMessage = null) {
+  if (customMessage && !viewingReplayId) {
+    thinkingBar.textContent = customMessage;
+    thinkingBar.classList.remove("hidden");
+    return;
+  }
   if (thinkingAgents.size === 0 || viewingReplayId) {
     thinkingBar.classList.add("hidden");
     thinkingBar.textContent = "";
@@ -207,7 +281,6 @@ async function loadHistory() {
     if (!resp.ok) return;
     const payload = await resp.json();
 
-    // Update topbar storage indicator
     if (payload.redis_available) {
       storageBadge.textContent = "Redis + JSON";
       storageBadge.className = "pill pill-redis";
@@ -273,6 +346,13 @@ async function openReplay(debateId) {
         replayFeed.appendChild(
           buildSystemCardElement(`👑 Kshitij (Creator Interjection): ${ev.data.message}`, "nudge-card")
         );
+      } else if (ev.type === "clarification_requested" || ev.type === "clarification_rejected") {
+        replayFeed.appendChild(buildVoteCardElement(ev.data));
+      } else if (ev.type === "clarification_answered") {
+        const prefix = ev.data.skipped ? "⏭️ Kshitij skipped clarification:" : "👑 Kshitij (Clarification):";
+        replayFeed.appendChild(
+          buildSystemCardElement(`${prefix} ${ev.data.answer}`, "clarify-answer-card")
+        );
       } else if (ev.type === "agent_error") {
         replayFeed.appendChild(
           buildSystemCardElement(`⚠️ ${ev.data.agent_name} error: ${ev.data.error}`, "error-card")
@@ -286,7 +366,6 @@ async function openReplay(debateId) {
       );
     }
 
-    // Swap visible stage from Live -> Replay
     feed.classList.add("hidden");
     replayFeed.classList.remove("hidden");
     thinkingBar.classList.add("hidden");
@@ -330,6 +409,7 @@ function connectWebSocket() {
   ws.onclose = () => {
     connBadge.textContent = "Reconnecting...";
     connBadge.className = "pill pill-offline";
+    hideClarificationPrompt();
     setControlsState({ debating: false });
     setTimeout(connectWebSocket, 2000);
   };
@@ -372,7 +452,8 @@ function connectWebSocket() {
 
       case "debate_started":
         if (viewingReplayId) exitReplay();
-        setControlsState({ debating: true, paused: false });
+        hideClarificationPrompt();
+        setControlsState({ debating: true, paused: false, clarifying: false });
         updateLiveBanner({
           visible: true,
           statusText: "LIVE",
@@ -385,13 +466,13 @@ function connectWebSocket() {
         break;
 
       case "debate_paused":
-        setControlsState({ debating: true, paused: true });
+        setControlsState({ debating: true, paused: true, clarifying: false });
         updateLiveBanner({ statusText: "PAUSED", statusBg: "#ca8a04" });
         appendSystemCard(`⏸️ Debate paused before Turn ${data.turn}.`);
         break;
 
       case "debate_resumed":
-        setControlsState({ debating: true, paused: false });
+        setControlsState({ debating: true, paused: false, clarifying: false });
         updateLiveBanner({ statusText: "LIVE", statusBg: "#3b82f6" });
         appendSystemCard(`▶️ Debate resumed at Turn ${data.turn}.`);
         break;
@@ -400,7 +481,40 @@ function connectWebSocket() {
         appendSystemCard(`👑 Kshitij (Creator Interjection): ${data.message}`, "nudge-card");
         break;
 
+      case "clarification_voting":
+        updateThinkingBar(`🗳️ ${data.requester_name} requested Kshitij's input — warriors are voting...`);
+        break;
+
+      case "clarification_requested":
+        updateThinkingBar();
+        recordVoteTokens(data);
+        renderRoster();
+        feed.appendChild(buildVoteCardElement(data));
+        scrollToBottom(feed);
+        setControlsState({ debating: true, paused: false, clarifying: true });
+        updateLiveBanner({ statusText: "AWAITING YOUR INPUT", statusBg: "#7c3aed" });
+        showClarificationPrompt(data);
+        break;
+
+      case "clarification_rejected":
+        updateThinkingBar();
+        recordVoteTokens(data);
+        renderRoster();
+        feed.appendChild(buildVoteCardElement(data));
+        scrollToBottom(feed);
+        break;
+
+      case "clarification_answered": {
+        hideClarificationPrompt();
+        setControlsState({ debating: true, paused: false, clarifying: false });
+        updateLiveBanner({ statusText: "LIVE", statusBg: "#3b82f6" });
+        const prefix = data.skipped ? "⏭️ Kshitij skipped clarification:" : "👑 Kshitij (Clarification):";
+        appendSystemCard(`${prefix} ${data.answer}`, "clarify-answer-card");
+        break;
+      }
+
       case "debate_ended": {
+        hideClarificationPrompt();
         setControlsState({ debating: false });
         thinkingAgents.clear();
         updateThinkingBar();
@@ -465,9 +579,21 @@ btnRefreshHistory.addEventListener("click", loadHistory);
 nudgeForm.addEventListener("submit", (e) => {
   e.preventDefault();
   const msg = nudgeInput.value.trim();
-  if (!msg || !isDebating) return;
+  if (!msg || !isDebating || awaitingClarification) return;
   sendCommand({ action: "nudge", message: msg });
   nudgeInput.value = "";
+});
+
+clarificationForm.addEventListener("submit", (e) => {
+  e.preventDefault();
+  const answer = clarificationInput.value.trim();
+  if (!answer || !awaitingClarification) return;
+  sendCommand({ action: "clarification_reply", answer });
+});
+
+btnClarifySkip.addEventListener("click", () => {
+  if (!awaitingClarification) return;
+  sendCommand({ action: "clarification_reply", answer: "" });
 });
 
 // Boot WebSocket & History immediately

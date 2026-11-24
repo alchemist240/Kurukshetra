@@ -137,26 +137,31 @@ class DebateStore:
         event_type: str,
         data: dict[str, Any],
     ) -> None:
-        """Records a single turn, interjection, or error live to Redis AND JSON."""
+        """Records a turn, clarification vote/answer, interjection, or error to Redis AND JSON."""
         record = {
             "type": event_type,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "data": data,
         }
 
+        # Count tokens from both regular agent turns AND parallel clarification votes
         added_tokens = 0
         if event_type == "agent_message":
             added_tokens = int(data.get("prompt_tokens", 0)) + int(data.get("completion_tokens", 0))
+        elif event_type in ("clarification_requested", "clarification_rejected"):
+            added_tokens = int(data.get("vote_tokens", 0))
+
+        is_debate_turn = event_type == "agent_message" and data.get("phase") == "debate"
 
         # 1. Update local JSON file immediately (safe even if server crashes mid-debate)
         path = self._json_path(debate_id)
         if path.exists():
             doc = json.loads(path.read_text(encoding="utf-8"))
             doc["events"].append(record)
-            if event_type == "agent_message":
+            if added_tokens:
                 doc["meta"]["total_tokens"] = int(doc["meta"].get("total_tokens", 0)) + added_tokens
-                if data.get("phase") == "debate":
-                    doc["meta"]["total_turns"] = int(doc["meta"].get("total_turns", 0)) + 1
+            if is_debate_turn:
+                doc["meta"]["total_turns"] = int(doc["meta"].get("total_turns", 0)) + 1
             path.write_text(json.dumps(doc, indent=2), encoding="utf-8")
 
         # 2. Push event to Redis List + atomically bump counters in Redis Hash
@@ -165,11 +170,10 @@ class DebateStore:
                 async with self._redis.pipeline(transaction=True) as pipe:
                     pipe.rpush(self._events_key(debate_id), json.dumps(record))
                     pipe.expire(self._events_key(debate_id), REDIS_TTL_SECONDS)
-                    if event_type == "agent_message":
-                        if added_tokens:
-                            pipe.hincrby(self._meta_key(debate_id), "total_tokens", added_tokens)
-                        if data.get("phase") == "debate":
-                            pipe.hincrby(self._meta_key(debate_id), "total_turns", 1)
+                    if added_tokens:
+                        pipe.hincrby(self._meta_key(debate_id), "total_tokens", added_tokens)
+                    if is_debate_turn:
+                        pipe.hincrby(self._meta_key(debate_id), "total_turns", 1)
                     await pipe.execute()
             except Exception as e:
                 print(f"[Storage] Redis write warning (append_event): {e}")

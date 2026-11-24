@@ -46,7 +46,7 @@
         <textarea
           id="topic-input"
           rows="3"
-          placeholder="e.g., Should startups build a custom agent runtime or adopt LangGraph?"
+          placeholder="e.g., Should I upgrade my current laptop or buy a brand new one right now?"
         ></textarea>
 
         <div class="row-inline">
@@ -78,7 +78,7 @@
       </section>
     </aside>
 
-    <!-- Right Stage: Live Debate Feed + Replay Feed + Interject Bar -->
+    <!-- Right Stage: Live Debate Feed + Replay Feed + Clarification Panel + Interject Bar -->
     <section class="stage">
       <div id="topic-banner" class="topic-banner hidden">
         <span id="stage-status" class="status-tag">LIVE</span>
@@ -95,6 +95,29 @@
       <div id="replay-feed" class="feed hidden"></div>
 
       <div id="thinking-bar" class="thinking-bar hidden"></div>
+
+      <!-- Majority-Approved Human Clarification Panel (appears when agents pause to ask you) -->
+      <div id="clarification-panel" class="clarification-panel hidden">
+        <div class="clarification-head">
+          <span class="clarify-badge">🗳️ CLARIFICATION REQUESTED</span>
+          <span id="clarification-meta" class="clarify-meta"></span>
+        </div>
+        <p id="clarification-question" class="clarification-question"></p>
+        <form id="clarification-form" class="clarification-form">
+          <input
+            id="clarification-input"
+            type="text"
+            placeholder="Type your answer to resume the debate from the next turn..."
+            autocomplete="off"
+          />
+          <button id="btn-clarify-submit" type="submit" class="btn btn-violet">
+            Send &amp; Resume
+          </button>
+          <button id="btn-clarify-skip" type="button" class="btn btn-ghost">
+            Skip
+          </button>
+        </form>
+      </div>
 
       <form id="nudge-form" class="nudge-bar">
         <input
